@@ -15,6 +15,8 @@ import signal
 import base58
 import csv  # Add this import
 from pathlib import Path  # Add this import
+from io import StringIO
+import queue
 
 import grpc
 from grpc import aio
@@ -43,8 +45,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Setup CSV logging
+# Configure CSV buffering
 csv_file = Path('pump_transactions.csv')
+csv_buffer = StringIO()
+csv_writer = csv.writer(csv_buffer)
+BUFFER_FLUSH_SIZE = 10  # Flush every 10 transactions
+tx_counter = 0
+
 if not csv_file.exists():
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -92,135 +99,55 @@ class MessageHandler:
         try:
             update_type = update.WhichOneof('update_oneof')
             
-            if update_type == 'slot':
-                # Do not log slot updates
-                return True
+            if update_type == 'transaction':
+                global tx_counter, csv_buffer, csv_writer
                 
-            elif update_type == 'account':
-                account = update.account
-                if account.account:
-                    logger.info(
-                        f"Account update: pubkey={account.account.pubkey.hex()}, "
-                        f"slot={account.slot}, "
-                        f"lamports={account.account.lamports}"
-                    )
-                return True
-                
-            elif update_type == 'transaction':
-                # Extract the wallet that did the txn (first account key is the fee payer/signer)
+                # Quick check for tracked wallets first
                 try:
                     txn = update.transaction.transaction.transaction
-                    fee_payer = None
-                    if hasattr(txn, "message"):
-                        msg = txn.message
-                        if msg.account_keys:
-                            fee_payer_bytes = msg.account_keys[0]
-                            if isinstance(fee_payer_bytes, str):
-                                fee_payer = fee_payer_bytes
-                            else:
-                                fee_payer = base58.b58encode(fee_payer_bytes).decode()
-                    if fee_payer is None or fee_payer not in addresses:
-                        return True  # Ignore txns not from tracked wallets
-                except Exception as e:
+                    if not (hasattr(txn, "message") and txn.message.account_keys):
+                        return True
+                    
+                    fee_payer_bytes = txn.message.account_keys[0]
+                    fee_payer = base58.b58encode(fee_payer_bytes).decode() if not isinstance(fee_payer_bytes, str) else fee_payer_bytes
+                    
+                    if fee_payer not in addresses:
+                        return True
+                except:
                     return True
 
-                # Get signature and current time
+                # Get signature and log
                 try:
                     sig_bytes = update.transaction.transaction.signature
-                    if isinstance(sig_bytes, str):
-                        sig_b58 = sig_bytes
-                    else:
-                        sig_b58 = base58.b58encode(sig_bytes).decode()
-                    
-                    # Get current time in ISO format with Z suffix
+                    sig_b58 = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
                     current_time = datetime.utcnow().isoformat() + "Z"
                     
-                    # Log to CSV
-                    with open(csv_file, 'a', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow([sig_b58, current_time])
+                    # Write to buffer
+                    csv_writer.writerow([sig_b58, current_time])
+                    tx_counter += 1
+                    
+                    # Flush buffer if needed
+                    if tx_counter >= BUFFER_FLUSH_SIZE:
+                        with open(csv_file, 'a', newline='') as f:
+                            f.write(csv_buffer.getvalue())
+                        csv_buffer.truncate(0)
+                        csv_buffer.seek(0)
+                        tx_counter = 0
+                        
                 except Exception as e:
                     logger.error(f"Failed to log transaction: {e}")
 
-                print("=== New Pump.fun Transaction ===")
-                # print(update)
-                # Extract and print Solscan link
-                try:
-                    sig_bytes = update.transaction.transaction.signature
-                    if isinstance(sig_bytes, str):
-                        sig_b58 = sig_bytes
-                    else:
-                        sig_b58 = base58.b58encode(sig_bytes).decode()
-                    print(f"Solscan: https://solscan.io/tx/{sig_b58}")
-                except Exception as e:
-                    print(f"Could not extract signature for Solscan link: {e}")
-                print(f"Wallet: {fee_payer}")
-
-                # Try to extract mint and buy/sell direction from token balances
-                try:
-                    meta = update.transaction.transaction.meta
-                    if hasattr(meta, 'pre_token_balances') and hasattr(meta, 'post_token_balances'):
-                        # Get the mint from the first token balance
-                        if len(meta.pre_token_balances) > 0:
-                            mint = meta.pre_token_balances[0].mint
-                        elif len(meta.post_token_balances) > 0:
-                            mint = meta.post_token_balances[0].mint
-                        else:
-                            mint = "Unknown"
-
-                        # Determine direction by comparing pre/post balances
-                        pre_balances = {tb.account_index: tb.ui_token_amount.ui_amount for tb in meta.pre_token_balances}
-                        post_balances = {tb.account_index: tb.ui_token_amount.ui_amount for tb in meta.post_token_balances}
-                        
-                        # If we see a new token balance appear in post (not in pre), it's likely a buy
-                        # If we see a token balance increase from pre to post, it's likely a buy
-                        direction = "Unknown"
-                        for idx, post_amount in post_balances.items():
-                            if idx not in pre_balances or post_amount > pre_balances[idx]:
-                                direction = "BUY"
-                                break
-                            elif post_amount < pre_balances[idx]:
-                                direction = "SELL"
-                                break
-
-                        print(f"Mint: {mint}")
-                        print(f"Direction: {direction}")
-                        
-                        # Print token amounts for verification
-                        # print("Token Balances:")
-                        # for tb in meta.post_token_balances:
-                        #     print(f"Account {tb.account_index}: {tb.ui_token_amount.ui_amount} {mint}")
-                    else:
-                        print("No token balance information available")
-                except Exception as e:
-                    print(f"Could not extract mint/direction: {e}")
-
-                print("===============================")
-                return True
-                
-            elif update_type == 'block':
-                block = update.block
-                logger.info(
-                    f"Block update: slot={block.slot}, "
-                    f"blockhash={block.blockhash.hex()}"
-                )
+                # Minimal print output
+                print(f"TX: {sig_b58} | Wallet: {fee_payer}")
                 return True
                 
             elif update_type == 'ping':
-                # Ping is handled specially in the subscription loop
                 return True
                 
             elif update_type == 'pong':
-                logger.info(f"Received pong response with id: {update.pong.id}")
                 return True
                 
-            elif update_type is None:
-                logger.error("Update not found in the message")
-                return False
-                
-            else:
-                logger.warning(f"Received unknown update type: {update_type}")
-                return True
+            return True
                 
         except Exception as e:
             logger.error(f"Error handling message: {e}")
@@ -256,10 +183,15 @@ class GrpcClient:
                 credentials = ssl_creds
 
             options = [
-                ('grpc.keepalive_time_ms', 30000),
-                ('grpc.keepalive_timeout_ms', 10000),
+                ('grpc.keepalive_time_ms', 10000),  # More frequent keepalive
+                ('grpc.keepalive_timeout_ms', 5000),
                 ('grpc.keepalive_permit_without_calls', True),
                 ('grpc.http2.max_pings_without_data', 0),
+                ('grpc.http2.min_time_between_pings_ms', 10000),
+                ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+                ('grpc.max_send_message_length', 100 * 1024 * 1024),  # 100MB
+                ('grpc.enable_retries', 1),
+                ('grpc.service_config', '{"loadBalancingConfig":[{"round_robin":{}}]}'),
             ]
             logger.info("Using secure (SSL/TLS) channel")
             self.channel = aio.secure_channel(
@@ -299,27 +231,23 @@ class SubscriptionManager:
         self.client = client
         self.handler = MessageHandler()
         self.shutdown_event = shutdown_event
-        self.ping_queue = asyncio.Queue()
+        self.ping_queue = asyncio.Queue(maxsize=1)  # Limit ping queue size
     
     async def run(self, stub: 'GeyserStub'):
         """Run the subscription loop"""
-        # Create subscription request
+        # Create subscription request - optimized for transactions only
         request = SubscribeRequest()
-        request.commitment = CommitmentLevel.CONFIRMED
+        request.commitment = CommitmentLevel.PROCESSED  # Use PROCESSED instead of CONFIRMED for speed
 
         # Setup transaction filter for Pump.fun program and addresses
         tx_filter = SubscribeRequestFilterTransactions()
-        # Add Pump.fun program id and all wallet addresses to account_include
         pumpfun_program = "4bcFeLv4f7wSWrL5gG1pA9F6vYQ2f7Yk6bHp7F6w8kUa"
         tx_filter.account_include.append(pumpfun_program)
         tx_filter.account_include.extend(addresses)
         request.transactions["pumpfun"].CopyFrom(tx_filter)
-
-        # Setup slot filter
-        slot_filter = SubscribeRequestFilterSlots()
-        slot_filter.filter_by_commitment = True
-        request.slots["client"].CopyFrom(slot_filter)
         
+        # Removed slot filter setup since we don't need it
+
         # Create request iterator that handles pings
         async def request_iterator():
             # First, yield the initial subscription request
