@@ -449,22 +449,26 @@ async def main():
     def signal_handler():
         logger.info("Shutting down gracefully...")
         shutdown_event.set()
-    
+
     try:
         # Load configuration
         config = Config()
         
-        # Setup signal handlers for graceful shutdown
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
+        # Cross-platform signal handling
+        if os.name == 'posix':  # Unix/Linux/macOS
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, signal_handler)
+        else:  # Windows
+            signal.signal(signal.SIGINT, lambda s, f: signal_handler())
+            signal.signal(signal.SIGTERM, lambda s, f: signal_handler())
         
         # Run with reconnection logic
         await run_with_reconnect(config, shutdown_event)
         
     except KeyboardInterrupt:
-        # This shouldn't happen with proper signal handling
-        pass
+        # Handle Ctrl+C on Windows
+        signal_handler()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
