@@ -121,8 +121,25 @@ async def public_feed(queue: asyncio.Queue, rpc_url: str, name: str, connect_del
             retry_idx += 1
 
 # === PumpPortal consumer ===
+class PingTracker:
+    def __init__(self):
+        self._counter = 0
+        self._start_time = None
+    
+    def start_ping(self):
+        self._start_time = datetime.now()
+        self._counter = (self._counter + 1) % 1000  # Keep IDs manageable
+        return self._counter
+    
+    def get_latency(self):
+        if self._start_time:
+            return (datetime.now() - self._start_time).total_seconds() * 1000
+        return None
+
 async def pumpportal_feed(queue: asyncio.Queue):
     await asyncio.sleep(1)
+    ping_tracker = PingTracker()
+    
     while True:
         try:
             async with websockets.connect(WSS_PUMPPORTAL, open_timeout=8) as ws:
@@ -130,21 +147,20 @@ async def pumpportal_feed(queue: asyncio.Queue):
                 await ws.send(json.dumps(payload))
                 print("Subscribed to PumpPortal...")
                 
-                # Add ping check loop
-                last_ping = datetime.now()
                 while True:
                     try:
-                        if (datetime.now() - last_ping).total_seconds() >= 30:
-                            ping_start = datetime.now()
-                            await ws.send(json.dumps({"method": "ping"}))
-                            last_ping = datetime.now()
+                        # Send ping every 30 seconds
+                        if not ping_tracker._start_time or (datetime.now() - ping_tracker._start_time).total_seconds() >= 30:
+                            ping_id = ping_tracker.start_ping()
+                            await ws.send(json.dumps({"method": "ping", "id": ping_id}))
 
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
                         data = json.loads(msg)
                         
                         if data.get("method") == "pong":
-                            latency = await calculate_latency(ping_start)
-                            print(f"PumpPortal Latency: {latency:.2f}ms")
+                            latency = ping_tracker.get_latency()
+                            if latency:
+                                print(f"PumpPortal Latency: {latency:.2f}ms")
                             continue
 
                         if data.get("txType") == "buy" and data.get("traderPublicKey") in ADDRESSES:
@@ -167,8 +183,7 @@ async def grpc_feed(queue: asyncio.Queue):
     await asyncio.sleep(0.5)
     retry_delays = [5, 10, 20, 40, 80, 100]
     retry_idx = 0
-    ping_queue = asyncio.Queue(maxsize=1)
-    last_ping_time = None
+    ping_tracker = PingTracker()
 
     while True:
         channel = None
@@ -198,11 +213,9 @@ async def grpc_feed(queue: asyncio.Queue):
                 yield request
                 while True:
                     try:
-                        nonlocal last_ping_time
-                        last_ping_time = datetime.now()
                         ping_request = SubscribeRequest()
                         ping = SubscribeRequestPing()
-                        ping.id = int(last_ping_time.timestamp() * 1000)  # Use timestamp as ID
+                        ping.id = ping_tracker.start_ping()
                         ping_request.ping.CopyFrom(ping)
                         yield ping_request
                         await asyncio.sleep(30)  # Send ping every 30 seconds
@@ -216,11 +229,11 @@ async def grpc_feed(queue: asyncio.Queue):
             async for update in stream:
                 if update.HasField('ping'):
                     try:
-                        if last_ping_time:
-                            latency = await calculate_latency(last_ping_time)
+                        latency = ping_tracker.get_latency()
+                        if latency:
                             print(f"gRPC Latency: {latency:.2f}ms")
                     except Exception as e:
-                        print(f"Error handling ping: {e}")
+                        print(f"Error handling ping response: {e}")
                     continue
 
                 if not update.HasField('transaction'):
