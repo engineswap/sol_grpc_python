@@ -17,6 +17,7 @@ import csv  # Add this import
 from pathlib import Path  # Add this import
 from io import StringIO
 import queue
+from time import time_ns
 
 import grpc
 from grpc import aio
@@ -122,6 +123,11 @@ class MessageHandler:
                     sig_b58 = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
                     current_time = datetime.utcnow().isoformat() + "Z"
                     
+                    # Calculate delay
+                    now_ms = time_ns() // 1_000_000  # Current time in milliseconds
+                    tx_created_ms = (update.created_at.seconds * 1000) + (update.created_at.nanos // 1_000_000)
+                    delay_ms = now_ms - tx_created_ms
+                    
                     # Write to buffer
                     csv_writer.writerow([sig_b58, current_time])
                     tx_counter += 1
@@ -137,8 +143,8 @@ class MessageHandler:
                 except Exception as e:
                     logger.error(f"Failed to log transaction: {e}")
 
-                # Minimal print output
-                print(f"TX: {sig_b58} | Wallet: {fee_payer}")
+                # Minimal print output with delay
+                print(f"TX: {sig_b58} | Wallet: {fee_payer} | Delay: {delay_ms}ms")
                 return True
                 
             elif update_type == 'ping':
