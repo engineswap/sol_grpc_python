@@ -122,35 +122,53 @@ async def public_feed(queue: asyncio.Queue, rpc_url: str, name: str, connect_del
 
 # === PumpPortal consumer ===
 async def pumpportal_feed(queue: asyncio.Queue):
-    await asyncio.sleep(1)  # Stagger PumpPortal connection slightly
-    while True:  # Reconnection loop
+    await asyncio.sleep(1)
+    while True:
         try:
             async with websockets.connect(WSS_PUMPPORTAL, open_timeout=8) as ws:
                 payload = {"method": "subscribeAccountTrade", "keys": list(ADDRESSES)}
                 await ws.send(json.dumps(payload))
                 print("Subscribed to PumpPortal...")
+                
+                # Add ping check loop
+                last_ping = datetime.now()
                 while True:
                     try:
-                        msg = await ws.recv()
+                        if (datetime.now() - last_ping).total_seconds() >= 30:
+                            ping_start = datetime.now()
+                            await ws.send(json.dumps({"method": "ping"}))
+                            last_ping = datetime.now()
+
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
                         data = json.loads(msg)
+                        
+                        if data.get("method") == "pong":
+                            latency = await calculate_latency(ping_start)
+                            print(f"PumpPortal Latency: {latency:.2f}ms")
+                            continue
+
+                        if data.get("txType") == "buy" and data.get("traderPublicKey") in ADDRESSES:
+                            sig = data.get("signature")
+                            if sig:
+                                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                                await queue.put(("pumpportal", sig, ts))
+                    except asyncio.TimeoutError:
+                        print("PumpPortal timeout, reconnecting...")
+                        break
                     except Exception as e:
                         print(f"PumpPortal error receiving message: {e}")
                         break
-                    if data.get("txType") == "buy" and data.get("traderPublicKey") in ADDRESSES:
-                        sig = data.get("signature")
-                        if sig:
-                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            await queue.put(("pumpportal", sig, ts))
         except Exception as e:
             print(f"PumpPortal connection error: {e}")
         await asyncio.sleep(3)
 
-# === GRPC consumer ===
+# Modify grpc_feed to track ping times
 async def grpc_feed(queue: asyncio.Queue):
     await asyncio.sleep(0.5)
     retry_delays = [5, 10, 20, 40, 80, 100]
     retry_idx = 0
     ping_queue = asyncio.Queue(maxsize=1)
+    last_ping_time = None
 
     while True:
         channel = None
@@ -176,19 +194,21 @@ async def grpc_feed(queue: asyncio.Queue):
             tx_filter.account_include.extend(ADDRESSES)
             request.transactions["pumpfun"].CopyFrom(tx_filter)
 
-            # Request iterator (keep existing code)
             async def request_iterator():
                 yield request
                 while True:
                     try:
-                        ping_id = await asyncio.wait_for(ping_queue.get(), timeout=1.0)
+                        nonlocal last_ping_time
+                        last_ping_time = datetime.now()
                         ping_request = SubscribeRequest()
                         ping = SubscribeRequestPing()
-                        ping.id = ping_id if isinstance(ping_id, int) else 1
+                        ping.id = int(last_ping_time.timestamp() * 1000)  # Use timestamp as ID
                         ping_request.ping.CopyFrom(ping)
                         yield ping_request
-                    except asyncio.TimeoutError:
-                        continue
+                        await asyncio.sleep(30)  # Send ping every 30 seconds
+                    except Exception as e:
+                        print(f"Error in ping request: {e}")
+                        await asyncio.sleep(1)
 
             print("Subscribed to gRPC feed...")
             stream = stub.Subscribe(request_iterator())
@@ -196,8 +216,9 @@ async def grpc_feed(queue: asyncio.Queue):
             async for update in stream:
                 if update.HasField('ping'):
                     try:
-                        ping_id = update.ping.id if hasattr(update.ping, 'id') else 1
-                        await ping_queue.put(ping_id)
+                        if last_ping_time:
+                            latency = await calculate_latency(last_ping_time)
+                            print(f"gRPC Latency: {latency:.2f}ms")
                     except Exception as e:
                         print(f"Error handling ping: {e}")
                     continue
@@ -245,27 +266,9 @@ async def grpc_feed(queue: asyncio.Queue):
                 except:
                     pass
 
-# === Race harness ===
-async def race():
-    queue = asyncio.Queue()
-    tasks = [
-        *[asyncio.create_task(public_feed(queue, rpc_url, f"rpc_{i+1}", connect_delay=i*1.5)) 
-          for i, rpc_url in enumerate(RPC_PROVIDERS)],
-        asyncio.create_task(pumpportal_feed(queue)),
-        asyncio.create_task(grpc_feed(queue))
-    ]
-
-    seen = {}  # sig -> (source, timestamp as datetime)
-
-    while True:
-        source, sig, ts = await queue.get()
-        now = datetime.now()
-        if sig not in seen:
-            print(f"[FASTEST] [{ts}] {source.upper()} got tx: {sig[:5]}")
-            seen[sig] = (source, now)
-        else:
-            print(f"[{ts}] {source.upper()} got tx: {sig[:5]}")
-
+# === Utility function to calculate latency ===
+async def calculate_latency(start_time):
+    return (datetime.now() - start_time).total_seconds() * 1000
 
 # === Race harness ===
 async def race():
