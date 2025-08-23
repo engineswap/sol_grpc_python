@@ -6,6 +6,7 @@ import websockets
 from solders.pubkey import Pubkey  # type: ignore
 from construct import Struct, Padding, Int64ul, Flag, Bytes
 import grpc
+import base58
 from grpc import aio
 from dotenv import load_dotenv
 import backoff
@@ -146,13 +147,14 @@ async def pumpportal_feed(queue: asyncio.Queue):
 
 # === GRPC consumer ===
 async def grpc_feed(queue: asyncio.Queue):
-    await asyncio.sleep(0.5)  # Small stagger
+    await asyncio.sleep(0.5)
     retry_delays = [5, 10, 20, 40, 80, 100]
     retry_idx = 0
-    
+    ping_queue = asyncio.Queue(maxsize=1)
+
     while True:
+        channel = None
         try:
-            # Setup channel
             channel = aio.insecure_channel(
                 GRPC_ENDPOINT,
                 options=[
@@ -165,20 +167,16 @@ async def grpc_feed(queue: asyncio.Queue):
             )
             stub = GeyserStub(channel)
 
-            # Setup subscription
+            # Setup subscription request
             request = SubscribeRequest()
             request.commitment = CommitmentLevel.PROCESSED
-
-            # Transaction filter
             tx_filter = SubscribeRequestFilterTransactions()
             pumpfun_program = "4bcFeLv4f7wSWrL5gG1pA9F6vYQ2f7Yk6bHp7F6w8kUa"
             tx_filter.account_include.append(pumpfun_program)
             tx_filter.account_include.extend(ADDRESSES)
             request.transactions["pumpfun"].CopyFrom(tx_filter)
 
-            # Handle pings
-            ping_queue = asyncio.Queue(maxsize=1)
-            
+            # Request iterator (keep existing code)
             async def request_iterator():
                 yield request
                 while True:
@@ -186,7 +184,7 @@ async def grpc_feed(queue: asyncio.Queue):
                         ping_id = await asyncio.wait_for(ping_queue.get(), timeout=1.0)
                         ping_request = SubscribeRequest()
                         ping = SubscribeRequestPing()
-                        ping.id = ping_id
+                        ping.id = ping_id if isinstance(ping_id, int) else 1
                         ping_request.ping.CopyFrom(ping)
                         yield ping_request
                     except asyncio.TimeoutError:
@@ -194,10 +192,14 @@ async def grpc_feed(queue: asyncio.Queue):
 
             print("Subscribed to gRPC feed...")
             stream = stub.Subscribe(request_iterator())
-            
+
             async for update in stream:
                 if update.HasField('ping'):
-                    await ping_queue.put(update.ping.id)
+                    try:
+                        ping_id = update.ping.id if hasattr(update.ping, 'id') else 1
+                        await ping_queue.put(ping_id)
+                    except Exception as e:
+                        print(f"Error handling ping: {e}")
                     continue
 
                 if not update.HasField('transaction'):
@@ -205,20 +207,28 @@ async def grpc_feed(queue: asyncio.Queue):
 
                 try:
                     txn = update.transaction.transaction.transaction
-                    if not (hasattr(txn, "message") and txn.message.account_keys):
-                        continue
+                    meta = update.transaction.transaction.meta
                     
-                    fee_payer_bytes = txn.message.account_keys[0]
-                    fee_payer = base58.b58encode(fee_payer_bytes).decode() if not isinstance(fee_payer_bytes, str) else fee_payer_bytes
-                    
-                    if fee_payer not in ADDRESSES:
+                    if not (hasattr(txn, "message") and txn.message.account_keys and hasattr(meta, 'log_messages')):
                         continue
 
+                    # Check if it's a buy transaction first
+                    logs = meta.log_messages
+                    if not ("Program log: Instruction: Buy" in logs and "Program log: Instruction: Sell" not in logs):
+                        continue
+
+                    # Get signature and fee payer
                     sig_bytes = update.transaction.transaction.signature
                     sig = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
-                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    await queue.put(("grpc", sig, ts))
-                except:
+                    fee_payer_bytes = txn.message.account_keys[0]
+                    fee_payer = base58.b58encode(fee_payer_bytes).decode() if not isinstance(fee_payer_bytes, str) else fee_payer_bytes
+
+                    # Only process if it's from a tracked wallet
+                    if fee_payer in ADDRESSES:
+                        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        await queue.put(("grpc", sig, ts))
+
+                except Exception as e:
                     continue
 
         except Exception as e:
@@ -229,7 +239,11 @@ async def grpc_feed(queue: asyncio.Queue):
             if retry_idx < len(retry_delays) - 1:
                 retry_idx += 1
         finally:
-            await channel.close()
+            if channel:
+                try:
+                    await channel.close()
+                except:
+                    pass
 
 # === Race harness ===
 async def race():
@@ -238,7 +252,29 @@ async def race():
         *[asyncio.create_task(public_feed(queue, rpc_url, f"rpc_{i+1}", connect_delay=i*1.5)) 
           for i, rpc_url in enumerate(RPC_PROVIDERS)],
         asyncio.create_task(pumpportal_feed(queue)),
-        asyncio.create_task(grpc_feed(queue))  # Add gRPC feed
+        asyncio.create_task(grpc_feed(queue))
+    ]
+
+    seen = {}  # sig -> (source, timestamp as datetime)
+
+    while True:
+        source, sig, ts = await queue.get()
+        now = datetime.now()
+        if sig not in seen:
+            print(f"[FASTEST] [{ts}] {source.upper()} got tx: {sig[:5]}")
+            seen[sig] = (source, now)
+        else:
+            print(f"[{ts}] {source.upper()} got tx: {sig[:5]}")
+
+
+# === Race harness ===
+async def race():
+    queue = asyncio.Queue()
+    tasks = [
+        *[asyncio.create_task(public_feed(queue, rpc_url, f"rpc_{i+1}", connect_delay=i*1.5)) 
+          for i, rpc_url in enumerate(RPC_PROVIDERS)],
+        asyncio.create_task(pumpportal_feed(queue)),
+        asyncio.create_task(grpc_feed(queue))
     ]
 
     seen = {}  # sig -> (source, timestamp as datetime)
