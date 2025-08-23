@@ -317,6 +317,17 @@ class SubscriptionManager:
             logger.info("Stream closed")
 
 
+def flush_csv_buffer():
+    """Flush remaining transactions in buffer to CSV"""
+    global csv_buffer, tx_counter
+    if tx_counter > 0:
+        with open(csv_file, 'a', newline='') as f:
+            f.write(csv_buffer.getvalue())
+        csv_buffer.truncate(0)
+        csv_buffer.seek(0)
+        tx_counter = 0
+
+
 async def run_with_reconnect(config: Config, shutdown_event: asyncio.Event):
     """Main loop with reconnection logic"""
     
@@ -376,6 +387,7 @@ async def main():
     
     def signal_handler():
         logger.info("Shutting down gracefully...")
+        flush_csv_buffer()  # Flush remaining transactions
         shutdown_event.set()
 
     try:
@@ -392,13 +404,17 @@ async def main():
             signal.signal(signal.SIGTERM, lambda s, f: signal_handler())
         
         # Run with reconnection logic
-        await run_with_reconnect(config, shutdown_event)
+        try:
+            await run_with_reconnect(config, shutdown_event)
+        finally:
+            flush_csv_buffer()  # Ensure buffer is flushed even on errors
         
     except KeyboardInterrupt:
         # Handle Ctrl+C on Windows
         signal_handler()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
+        flush_csv_buffer()  # Flush buffer on fatal errors
         sys.exit(1)
 
 
