@@ -13,25 +13,13 @@ import backoff
 from generated.geyser_pb2 import (
     SubscribeRequest,
     SubscribeRequestFilterTransactions,
-    SubscribeRequestPing,
     CommitmentLevel,
 )
 from generated.geyser_pb2_grpc import GeyserStub
 
 # === Constants ===
 RPC_PROVIDERS = [
-    "wss://api.mainnet-beta.solana.com",
-    # "wss://divine-cold-scion.solana-mainnet.quiknode.pro/1d20a0810f6e27ef89418fa7a796a5d4854e2a0d/",
-    "wss://mainnet.helius-rpc.com/?api-key=7c341961-535e-4e5e-99b7-ea99b59381c2"
-    # "wss://solana-rpc.publicnode.com",
-    # "wss://solana.drpc.org/",
-    # "wss://solana.rpc.grove.city/v1/01fdb492",
-    # "wss://solana.api.onfinality.io/public",
-    # "wss://public.rpc.solanavibestation.com/",
-    # "wss://solana.therpc.io",
-    # "wss://solana-devnet.api.onfinality.io/public",
-    # "wss://api.devnet.solana.com",
-    # "wss://api.testnet.solana.com"
+    "wss://api.mainnet-beta.solana.com"
 ]
 WSS_PUMPPORTAL = "wss://pumpportal.fun/api/data"
 GRPC_ENDPOINT = "grpc.solanavibestation.com:10000"  # Add your endpoint
@@ -121,24 +109,8 @@ async def public_feed(queue: asyncio.Queue, rpc_url: str, name: str, connect_del
             retry_idx += 1
 
 # === PumpPortal consumer ===
-class PingTracker:
-    def __init__(self):
-        self._counter = 0
-        self._start_time = None
-    
-    def start_ping(self):
-        self._start_time = datetime.now()
-        self._counter = (self._counter + 1) % 1000  # Keep IDs manageable
-        return self._counter
-    
-    def get_latency(self):
-        if self._start_time:
-            return (datetime.now() - self._start_time).total_seconds() * 1000
-        return None
-
 async def pumpportal_feed(queue: asyncio.Queue):
     await asyncio.sleep(1)
-    ping_tracker = PingTracker()
     
     while True:
         try:
@@ -149,28 +121,17 @@ async def pumpportal_feed(queue: asyncio.Queue):
                 
                 while True:
                     try:
-                        # Send ping every 30 seconds
-                        if not ping_tracker._start_time or (datetime.now() - ping_tracker._start_time).total_seconds() >= 30:
-                            ping_id = ping_tracker.start_ping()
-                            await ws.send(json.dumps({"method": "ping", "id": ping_id}))
-
-                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30)  # Increased timeout to 30 seconds
                         data = json.loads(msg)
                         
-                        if data.get("method") == "pong":
-                            latency = ping_tracker.get_latency()
-                            if latency:
-                                print(f"PumpPortal Latency: {latency:.2f}ms")
-                            continue
-
                         if data.get("txType") == "buy" and data.get("traderPublicKey") in ADDRESSES:
                             sig = data.get("signature")
                             if sig:
                                 ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                                 await queue.put(("pumpportal", sig, ts))
                     except asyncio.TimeoutError:
-                        print("PumpPortal timeout, reconnecting...")
-                        break
+                        # Instead of breaking, just try to receive again
+                        continue
                     except Exception as e:
                         print(f"PumpPortal error receiving message: {e}")
                         break
@@ -183,7 +144,6 @@ async def grpc_feed(queue: asyncio.Queue):
     await asyncio.sleep(0.5)
     retry_delays = [5, 10, 20, 40, 80, 100]
     retry_idx = 0
-    ping_tracker = PingTracker()
 
     while True:
         channel = None
@@ -209,33 +169,10 @@ async def grpc_feed(queue: asyncio.Queue):
             tx_filter.account_include.extend(ADDRESSES)
             request.transactions["pumpfun"].CopyFrom(tx_filter)
 
-            async def request_iterator():
-                yield request
-                while True:
-                    try:
-                        ping_request = SubscribeRequest()
-                        ping = SubscribeRequestPing()
-                        ping.id = ping_tracker.start_ping()
-                        ping_request.ping.CopyFrom(ping)
-                        yield ping_request
-                        await asyncio.sleep(30)  # Send ping every 30 seconds
-                    except Exception as e:
-                        print(f"Error in ping request: {e}")
-                        await asyncio.sleep(1)
-
             print("Subscribed to gRPC feed...")
-            stream = stub.Subscribe(request_iterator())
+            stream = stub.Subscribe(iter([request]))
 
             async for update in stream:
-                if update.HasField('ping'):
-                    try:
-                        latency = ping_tracker.get_latency()
-                        if latency:
-                            print(f"gRPC Latency: {latency:.2f}ms")
-                    except Exception as e:
-                        print(f"Error handling ping response: {e}")
-                    continue
-
                 if not update.HasField('transaction'):
                     continue
 
@@ -278,10 +215,6 @@ async def grpc_feed(queue: asyncio.Queue):
                     await channel.close()
                 except:
                     pass
-
-# === Utility function to calculate latency ===
-async def calculate_latency(start_time):
-    return (datetime.now() - start_time).total_seconds() * 1000
 
 # === Race harness ===
 async def race():
