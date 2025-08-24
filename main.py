@@ -17,7 +17,7 @@ import csv  # Add this import
 from pathlib import Path  # Add this import
 from io import StringIO
 import queue
-from time import time_ns
+from time import time_ns, time
 
 import grpc
 from grpc import aio
@@ -47,16 +47,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configure CSV buffering
-csv_file = Path('pump_transactions.csv')
+csv_file = Path('pumpportal_txns.csv')
 csv_buffer = StringIO()
 csv_writer = csv.writer(csv_buffer)
 BUFFER_FLUSH_SIZE = 10  # Flush every 10 transactions
 tx_counter = 0
 
+# Initialize CSV file with header if it doesn't exist
 if not csv_file.exists():
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['signature', 'recv_wall_iso'])
+        writer.writerow(['timestamp_ms', 'txn_id'])
 
 
 class Config:
@@ -121,7 +122,9 @@ class MessageHandler:
                 try:
                     sig_bytes = update.transaction.transaction.signature
                     sig_b58 = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
-                    current_time = datetime.utcnow().isoformat() + "Z"
+                    
+                    # Get current timestamp in milliseconds (Unix format)
+                    current_time_ms = int(time() * 1000)
                     
                     # Calculate delay
                     now_ms = time_ns() // 1_000_000  # Current time in milliseconds
@@ -129,7 +132,7 @@ class MessageHandler:
                     delay_ms = now_ms - tx_created_ms
                     
                     # Write to buffer
-                    csv_writer.writerow([sig_b58, current_time])
+                    csv_writer.writerow([current_time_ms, sig_b58])
                     tx_counter += 1
                     
                     # Flush buffer if needed
@@ -143,8 +146,8 @@ class MessageHandler:
                 except Exception as e:
                     logger.error(f"Failed to log transaction: {e}")
 
-                # Minimal print output with delay
-                print(f"TX: {sig_b58} | Wallet: {fee_payer} | Delay: {delay_ms}ms")
+                # Print in the requested format
+                print(f"[{current_time_ms}] {sig_b58}")
                 return True
                 
             elif update_type == 'ping':
