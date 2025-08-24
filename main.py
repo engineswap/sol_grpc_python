@@ -47,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configure CSV buffering
-csv_file = Path('pumpportal_txns.csv')
+csv_file = Path('grpc_txns.csv')
 csv_buffer = StringIO()
 csv_writer = csv.writer(csv_buffer)
 BUFFER_FLUSH_SIZE = 10  # Flush every 10 transactions
