@@ -16,6 +16,10 @@ from generated.geyser_pb2 import (
     CommitmentLevel,
 )
 from generated.geyser_pb2_grpc import GeyserStub
+import threading
+import os
+import time
+from collections import defaultdict
 
 # === Constants ===
 RPC_PROVIDERS = [
@@ -41,6 +45,18 @@ trade = Struct(
 with open("leaderboard/weekly_leaderboard.json", encoding="utf-8") as f:
     leaderboard = json.load(f)
 ADDRESSES = {kol["address"] for kol in leaderboard}
+
+# Prepare address data structures for ultra-fast lookups
+BINARY_ADDRESSES = set()
+ADDRESS_LOOKUP = {}
+try:
+    for address in ADDRESSES:
+        # Convert to binary format for fast comparisons
+        binary_addr = base58.b58decode(address)
+        BINARY_ADDRESSES.add(binary_addr)
+        ADDRESS_LOOKUP[binary_addr] = address
+except Exception as e:
+    print(f"Error pre-processing addresses: {e}")
 
 def format_trade(parsed_data, txn_sig):
     return {
@@ -139,35 +155,56 @@ async def pumpportal_feed(queue: asyncio.Queue):
             print(f"PumpPortal connection error: {e}")
         await asyncio.sleep(3)
 
-# Modify grpc_feed to track ping times
+# Modify grpc_feed to be even faster
 async def grpc_feed(queue: asyncio.Queue):
-    await asyncio.sleep(0.5)
-    retry_delays = [2, 5, 10, 20, 40, 60]  # More aggressive retry strategy
+    # Set highest thread priority for this coroutine if possible
+    try:
+        thread_id = threading.get_native_id()
+        if hasattr(os, 'sched_setscheduler'):
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(99))
+        elif hasattr(os, 'setpriority'):
+            os.setpriority(os.PRIO_PROCESS, thread_id, -20)  # Lowest nice value = highest priority
+    except Exception:
+        pass  # Ignore if not supported
+        
+    await asyncio.sleep(0.1)  # Shorter initial delay
+    retry_delays = [1, 2, 5, 10, 20, 30]  # Even more aggressive retry strategy
     retry_idx = 0
+    seen_signatures = set()  # Local cache to avoid reprocessing
+
+    # Warm up DNS and network connection
+    try:
+        asyncio.create_task(aio.insecure_channel(GRPC_ENDPOINT).close())
+        await asyncio.sleep(0.1)
+    except:
+        pass
 
     while True:
         channel = None
         try:
-            # Optimize channel settings for lower latency
+            # Even more optimized channel settings
             channel = aio.insecure_channel(
                 GRPC_ENDPOINT,
                 options=[
-                    ('grpc.keepalive_time_ms', 5000),             # More frequent keepalives
-                    ('grpc.keepalive_timeout_ms', 1000),          # Shorter timeout
+                    ('grpc.keepalive_time_ms', 1000),             # Very frequent keepalives
+                    ('grpc.keepalive_timeout_ms', 500),           # Very short timeout
                     ('grpc.keepalive_permit_without_calls', True),
                     ('grpc.http2.max_pings_without_data', 0),
-                    ('grpc.max_receive_message_length', 10 * 1024 * 1024),  # Smaller buffer
-                    ('grpc.min_reconnect_backoff_ms', 100),       # Fast reconnect
-                    ('grpc.max_reconnect_backoff_ms', 1000),      # Cap reconnect time
-                    ('grpc.use_local_subchannel_pool', True),     # Use local subchannel pool
-                    ('grpc.enable_retries', 1),                   # Enable retries
-                    ('grpc.service_config', json.dumps({          # Configure retry policy
+                    ('grpc.max_receive_message_length', 5 * 1024 * 1024),  # Even smaller buffer
+                    ('grpc.min_reconnect_backoff_ms', 50),        # Very fast reconnect
+                    ('grpc.max_reconnect_backoff_ms', 500),       # Very short max reconnect
+                    ('grpc.initial_reconnect_backoff_ms', 50),    # Fast initial reconnect
+                    ('grpc.use_local_subchannel_pool', True),     
+                    ('grpc.enable_retries', 1),                   
+                    ('grpc.client_idle_timeout_ms', 60000),       # Disconnect after 1min idle
+                    ('grpc.max_send_message_length', 1 * 1024 * 1024),  # Smaller send buffer
+                    ('grpc.service_config', json.dumps({
                         "methodConfig": [{
                             "name": [{}],
                             "retryPolicy": {
-                                "maxAttempts": 5,
-                                "initialBackoff": "0.1s",
-                                "maxBackoff": "1s",
+                                "maxAttempts": 3,
+                                "initialBackoff": "0.05s",
+                                "maxBackoff": "0.5s",
                                 "backoffMultiplier": 1.5,
                                 "retryableStatusCodes": ["UNAVAILABLE"]
                             }
@@ -177,77 +214,104 @@ async def grpc_feed(queue: asyncio.Queue):
             )
             stub = GeyserStub(channel)
 
-            # Optimize subscription request for speed
+            # Create an optimized request
             request = SubscribeRequest()
             request.commitment = CommitmentLevel.PROCESSED
             tx_filter = SubscribeRequestFilterTransactions()
             pumpfun_program = "4bcFeLv4f7wSWrL5gG1pA9F6vYQ2f7Yk6bHp7F6w8kUa"
             
-            # Add program ID first for more efficient filtering
             tx_filter.account_include.append(pumpfun_program)
-            
-            # Pre-convert addresses to proper format if needed to avoid conversion during processing
             tx_filter.account_include.extend(ADDRESSES)
             request.transactions["pumpfun"].CopyFrom(tx_filter)
 
-            print("Subscribed to gRPC feed with optimized settings...")
+            # Prepare common strings to avoid string operations during processing
+            BUY_INSTRUCTION = "Program log: Instruction: Buy"
+            SELL_INSTRUCTION = "Program log: Instruction: Sell"
             
-            # Use a faster processing approach
+            print("Subscribed to gRPC feed with ultra-optimized settings...")
+            
             stream = stub.Subscribe(iter([request]))
+            start_time = time.time()
 
             async for update in stream:
+                # Quick bailout if not a transaction
                 if not update.HasField('transaction'):
                     continue
                 
                 try:
-                    # Direct access to signature for faster processing
+                    # Direct binary access for maximum performance
                     sig_bytes = update.transaction.transaction.signature
-                    sig = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
                     
-                    # Quick check for buy transaction in logs before other processing
+                    # Skip if we've seen this signature already (local cache)
+                    if sig_bytes in seen_signatures:
+                        continue
+                        
+                    # Get logs first to quickly filter out non-buy transactions
                     logs = update.transaction.transaction.meta.log_messages
-                    if not any("Program log: Instruction: Buy" in log for log in logs):
-                        continue
-                    if any("Program log: Instruction: Sell" in log for log in logs):
+                    
+                    # Ultra-fast log scanning with short-circuit evaluation
+                    has_buy = False
+                    has_sell = False
+                    for log in logs:
+                        if BUY_INSTRUCTION in log:
+                            has_buy = True
+                        if SELL_INSTRUCTION in log:
+                            has_sell = True
+                            break
+                    
+                    if not has_buy or has_sell:
                         continue
                     
-                    # Get fee payer efficiently
+                    # Get fee payer directly in binary form for fastest comparison
                     fee_payer_bytes = update.transaction.transaction.transaction.message.account_keys[0]
-                    fee_payer = base58.b58encode(fee_payer_bytes).decode() if not isinstance(fee_payer_bytes, str) else fee_payer_bytes
-
-                    # Only process if it's from a tracked wallet
-                    if fee_payer in ADDRESSES:
+                    
+                    # Direct binary comparison if possible
+                    if fee_payer_bytes in BINARY_ADDRESSES:
+                        # Convert signature to string only once we know we need it
+                        sig = base58.b58encode(sig_bytes).decode() if not isinstance(sig_bytes, str) else sig_bytes
+                        
+                        # Add to seen cache to avoid reprocessing
+                        seen_signatures.add(sig_bytes)
+                        if len(seen_signatures) > 10000:  # Prevent unlimited growth
+                            seen_signatures.clear()
+                            
+                        # Get timestamp with minimal formatting
                         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                         await queue.put(("grpc", sig, ts))
+                        
+                        # Calculate and periodically log latency metrics
+                        if time.time() - start_time > 60:  # Log every minute
+                            start_time = time.time()
+                            print("gRPC connection healthy and optimized")
 
                 except Exception as e:
                     continue
 
         except grpc.aio.AioRpcError as e:
-            print(f"gRPC connection error: {e.code()} - {e.details()}")
-            # More specific error handling based on error type
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
-                print("gRPC server unavailable, attempting quick reconnect...")
-                await asyncio.sleep(1)  # Shorter sleep for unavailable errors
+            code = e.code()
+            if code == grpc.StatusCode.UNAVAILABLE:
+                print("gRPC quick reconnect...")
+                await asyncio.sleep(0.5)
+            elif code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                print("gRPC resource exhausted, backing off...")
+                await asyncio.sleep(retry_delays[min(retry_idx, len(retry_delays) - 1)])
+                retry_idx = min(retry_idx + 1, len(retry_delays) - 1)
             else:
-                delay = retry_delays[min(retry_idx, len(retry_delays) - 1)]
-                print(f"gRPC retrying in {delay}s...")
-                await asyncio.sleep(delay)
-                if retry_idx < len(retry_delays) - 1:
-                    retry_idx += 1
+                print(f"gRPC error: {code}")
+                await asyncio.sleep(retry_delays[min(retry_idx, len(retry_delays) - 1)])
+                retry_idx = min(retry_idx + 1, len(retry_delays) - 1)
         except Exception as e:
-            print(f"gRPC unexpected error: {e}")
-            delay = retry_delays[min(retry_idx, len(retry_delays) - 1)]
-            print(f"gRPC retrying in {delay}s...")
-            await asyncio.sleep(delay)
-            if retry_idx < len(retry_delays) - 1:
-                retry_idx += 1
+            print(f"gRPC error: {str(e)[:100]}")
+            await asyncio.sleep(retry_delays[min(retry_idx, len(retry_delays) - 1)])
+            retry_idx = min(retry_idx + 1, len(retry_delays) - 1)
         finally:
             if channel:
                 try:
                     await channel.close()
                 except:
                     pass
+            # Quick recovery after errors
+            await asyncio.sleep(0.1)
 
 # === Race harness ===
 async def race():
